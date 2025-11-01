@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environment
+.venv/
+venv/
+env/
+
+# Flask
+instance/
+.webassets-cache
+flask_session/
+
+# Database
+*.db
+*.sqlite3
+
+# Environment variables
+.env*
+
+# IDEs
+.vscode/
+.idea/
+.DS_Store
+
+# Celery
+celerybeat-schedule*
+
+# Redis / Vercel
+dump.rdb
+.vercel
