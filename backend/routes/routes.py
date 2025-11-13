@@ -277,3 +277,73 @@ def register_routes(app, cache):
             'role': user.role,
             'avatar': user.avatar
         }), 200
+
+    # Profile
+
+    @app.route('/api/user/profile/<int:user_id>', methods=['PUT'])
+    @login_required
+    def update_profile(user_id):
+        if g.user.id != user_id:
+            return jsonify({'message': 'Not allowed'}), 403
+
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            data = {}
+        user = g.user
+
+        username = str(data['username']).strip() if data.get('username') else None
+        email = str(data['email']).strip().lower() if data.get('email') else None
+        new_password = str(data['newPassword']) if data.get('newPassword') else None
+        avatar = str(data['avatar']).strip() if data.get('avatar') else None
+
+        error = validate_account(username, email, new_password)
+        if error:
+            return jsonify({'message': error}), 400
+        if avatar and avatar not in AVATARS:
+            return jsonify({'message': 'Please choose one of the available avatars'}), 400
+
+        if username and User.query.filter(User.username == username, User.id != user.id).first():
+            return jsonify({'message': 'Username already taken'}), 409
+        if email and User.query.filter(User.email == email, User.id != user.id).first():
+            return jsonify({'message': 'Email already taken'}), 409
+
+        if new_password:
+            if not data.get('currentPassword'):
+                return jsonify({'message': 'Current password is required'}), 400
+            if not user.check_password(str(data['currentPassword'])):
+                return jsonify({'message': 'Current password is incorrect'}), 403
+            user.set_password(new_password)
+
+        username_changed = bool(username) and username != user.username
+        if username:
+            user.username = username
+        if email:
+            user.email = email
+        if avatar:
+            user.avatar = avatar
+
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            return jsonify({'message': 'Username or email already taken'}), 409
+
+        session['username'] = user.username
+
+        keys = ['all_users']
+        if username_changed:
+            # The admin spot grid shows the username of an active booking
+            active = Reservation.query.filter_by(user_id=user.id, status='active').first()
+            if active:
+                keys.append(f'parking_spots_{active.spot.lot_id}')
+        invalidate(*keys)
+
+        return jsonify({
+            'message': 'Profile updated successfully',
+            'user': {
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'avatar': user.avatar
+            }
+        }), 200
