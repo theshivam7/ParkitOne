@@ -278,6 +278,158 @@ def register_routes(app, cache):
             'avatar': user.avatar
         }), 200
 
+    # Parking lots
+
+    @app.route('/api/parking-lots', methods=['GET'])
+    @cache.cached(timeout=60, key_prefix='all_parking_lots')
+    def get_parking_lots():
+        lots = ParkingLot.query.filter_by(is_deleted=False).all()
+        available = dict(db.session.query(ParkingSpot.lot_id, db.func.count()).filter(
+            ParkingSpot.status == 'A').group_by(ParkingSpot.lot_id).all())
+        result = []
+
+        for lot in lots:
+            result.append({
+                'id': lot.id,
+                'prime_location_name': lot.prime_location_name,
+                'address': lot.address,
+                'pin_code': lot.pin_code,
+                'price': lot.price,
+                'number_of_spots': lot.number_of_spots,
+                'available_spots': available.get(lot.id, 0)
+            })
+
+        return jsonify(result), 200
+
+    @app.route('/api/parking-lots', methods=['POST'])
+    @admin_required
+    def create_parking_lot():
+        values, error = read_lot(request.get_json(silent=True))
+        if error:
+            return jsonify({'message': error}), 400
+
+        lot = ParkingLot(**values)
+        lot.spots = [ParkingSpot(status='A') for _ in range(values['number_of_spots'])]
+        db.session.add(lot)
+        db.session.commit()
+
+        # Lot names and prices appear in most cached responses
+        invalidate()
+
+        try:
+            tasks.notify_inactive_users_new_lot.delay(lot.id)
+        except Exception:
+            app.logger.exception('Failed to queue new lot notifications for lot %s', lot.id)
+
+        return jsonify({
+            'message': 'Parking lot created successfully. Inactive users will be notified via email.',
+            'lot_id': lot.id
+        }), 201
+
+    @app.route('/api/parking-lots/<int:lot_id>', methods=['PUT'])
+    @admin_required
+    def update_parking_lot(lot_id):
+        lot = db.session.get(ParkingLot, lot_id)
+
+        if not lot or lot.is_deleted:
+            return jsonify({'message': 'Parking lot not found'}), 404
+
+        values, error = read_lot(request.get_json(silent=True), partial=True)
+        if error:
+            return jsonify({'message': error}), 400
+
+        new_spots = values.pop('number_of_spots', None)
+        current_spots = len(lot.spots)
+        to_remove = []
+
+        if new_spots is not None and new_spots < current_spots:
+            free = ParkingSpot.query.filter_by(lot_id=lot.id, status='A').order_by(ParkingSpot.id.desc()).all()
+            if len(free) < current_spots - new_spots:
+                occupied = current_spots - len(free)
+                return jsonify({'message': f"Cannot reduce to {new_spots} {'spot' if new_spots == 1 else 'spots'}: "
+                                           f"{occupied} {'spot is' if occupied == 1 else 'spots are'} occupied"}), 400
+
+            # Remove spots without booking history first so past bookings stay linked
+            free.sort(key=lambda spot: bool(spot.reservations))
+            to_remove = free[:current_spots - new_spots]
+            if any(spot.reservations for spot in to_remove):
+                return jsonify({'message': f"Cannot reduce to {new_spots} {'spot' if new_spots == 1 else 'spots'}: some free spots have booking history"}), 400
+
+        for key, value in values.items():
+            setattr(lot, key, value)
+
+        if new_spots is not None:
+            for spot in to_remove:
+                db.session.delete(spot)
+            for _ in range(new_spots - current_spots):
+                db.session.add(ParkingSpot(lot_id=lot.id, status='A'))
+            lot.number_of_spots = new_spots
+
+        try:
+            db.session.commit()
+        except IntegrityError:
+            # A spot chosen for removal was booked in the meantime
+            db.session.rollback()
+            return jsonify({'message': 'Spots changed while updating. Please try again.'}), 409
+
+        invalidate()
+
+        return jsonify({'message': 'Parking lot updated successfully'}), 200
+
+    @app.route('/api/parking-lots/<int:lot_id>', methods=['DELETE'])
+    @admin_required
+    def delete_parking_lot(lot_id):
+        lot = db.session.get(ParkingLot, lot_id)
+
+        if not lot:
+            return jsonify({'message': 'Parking lot not found'}), 404
+
+        if lot.is_deleted:
+            return jsonify({'message': 'Parking lot already deleted'}), 409
+
+        # Soft delete keeps past reservations linked to the lot.
+        # Checking for occupied spots in the same statement stops a booking from landing in between.
+        deleted = ParkingLot.query.filter(
+            ParkingLot.id == lot.id, ~ParkingLot.spots.any(ParkingSpot.status == 'O')
+        ).update({'is_deleted': True})
+
+        if not deleted:
+            db.session.rollback()
+            return jsonify({'message': 'Cannot delete parking lot with occupied spots. Please wait for all vehicles to leave.'}), 400
+
+        db.session.commit()
+
+        invalidate()
+
+        return jsonify({'message': 'Parking lot deleted successfully'}), 200
+
+    @app.route('/api/admin/parking-lots-revenue', methods=['GET'])
+    @admin_required
+    @cache.cached(timeout=120, key_prefix='parking_lots_revenue')
+    def get_parking_lots_revenue():
+        lots = ParkingLot.query.filter_by(is_deleted=False).all()
+        totals = {lot_id: (revenue, count) for lot_id, revenue, count in db.session.query(
+            ParkingSpot.lot_id, db.func.sum(Reservation.parking_cost), db.func.count(Reservation.id)
+        ).join(Reservation).filter(
+            Reservation.status == 'completed',
+            Reservation.parking_cost.isnot(None)
+        ).group_by(ParkingSpot.lot_id)}
+        result = []
+
+        for lot in lots:
+            revenue, bookings = totals.get(lot.id, (0, 0))
+            result.append({
+                'lot_id': lot.id,
+                'location_name': lot.prime_location_name,
+                'revenue': round(revenue, 2),
+                'total_spots': lot.number_of_spots,
+                'bookings_count': bookings
+            })
+
+        result.sort(key=lambda x: x['revenue'], reverse=True)
+
+        return jsonify(result), 200
+
     # Profile
 
     @app.route('/api/user/profile/<int:user_id>', methods=['PUT'])
