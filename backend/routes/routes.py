@@ -430,6 +430,194 @@ def register_routes(app, cache):
 
         return jsonify(result), 200
 
+    # Reservations
+
+    @app.route('/api/book-spot', methods=['POST'])
+    @login_required
+    def book_spot():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            data = {}
+
+        if g.user.role != 'user':
+            return jsonify({'message': 'Only users can book parking spots'}), 403
+
+        user_id = g.user.id
+        lot_id = data.get('lot_id')
+        vehicle_number = re.sub(r'[\s-]', '', str(data.get('vehicle_number') or '')).upper()
+
+        if not lot_id or not vehicle_number:
+            return jsonify({'message': 'Missing required fields'}), 400
+        if not VEHICLE_RE.match(vehicle_number):
+            return jsonify({'message': 'Enter a valid vehicle number, e.g. MH12AB1234'}), 400
+
+        lot = db.session.get(ParkingLot, lot_id) if isinstance(lot_id, int) or str(lot_id).isdigit() else None
+        if not lot or lot.is_deleted:
+            return jsonify({'message': 'Parking lot not found'}), 404
+
+        existing_booking = Reservation.query.filter_by(user_id=user_id, status='active').first()
+        if existing_booking:
+            return jsonify({'message': 'You already have an active booking. Please release it before booking a new spot.'}), 409
+
+        # Claim a spot only if it is still free and its lot was not deleted meanwhile,
+        # so two concurrent bookings cannot get the same spot
+        spot = None
+        candidates = ParkingSpot.query.filter_by(lot_id=lot.id, status='A').order_by(ParkingSpot.id).limit(5).all()
+        for candidate in candidates:
+            if ParkingSpot.query.filter(
+                ParkingSpot.id == candidate.id, ParkingSpot.status == 'A',
+                ParkingSpot.parking_lot.has(is_deleted=False)
+            ).update({'status': 'O'}) == 1:
+                spot = candidate
+                break
+
+        if not spot:
+            db.session.rollback()
+            return jsonify({'message': 'No available spots in this parking lot'}), 409
+
+        reservation = Reservation(
+            spot_id=spot.id,
+            user_id=user_id,
+            vehicle_number=vehicle_number,
+            parking_timestamp=utcnow(),
+            price_per_hour=lot.price,
+            status='active'
+        )
+        db.session.add(reservation)
+        try:
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            return jsonify({'message': 'You already have an active booking.'}), 409
+
+        invalidate('all_parking_lots', f'parking_spots_{lot.id}', f'user_reservations_{user_id}',
+                   f'user_stats_{user_id}', 'admin_dashboard_stats', 'parking_lots_revenue', 'all_users')
+
+        return jsonify({
+            'message': 'Spot booked successfully',
+            'spot_id': spot.id,
+            'reservation_id': reservation.id
+        }), 201
+
+    @app.route('/api/release-spot/<int:reservation_id>', methods=['PUT'])
+    @login_required
+    def release_spot(reservation_id):
+        reservation = db.session.get(Reservation, reservation_id)
+
+        if not reservation:
+            return jsonify({'message': 'Reservation not found'}), 404
+
+        if reservation.user_id != g.user.id:
+            return jsonify({'message': 'Not allowed'}), 403
+
+        if reservation.status != 'active':
+            return jsonify({'message': 'This reservation has already been released'}), 409
+
+        lot_id = reservation.spot.lot_id
+        leaving = utcnow()
+        cost = round(billed_hours(reservation.parking_timestamp, leaving) * booked_price(reservation), 2)
+
+        # Only one of two concurrent releases may complete the booking
+        released = Reservation.query.filter_by(id=reservation.id, status='active').update(
+            {'status': 'completed', 'leaving_timestamp': leaving, 'parking_cost': cost})
+        if released == 0:
+            db.session.rollback()
+            return jsonify({'message': 'This reservation has already been released'}), 409
+        ParkingSpot.query.filter_by(id=reservation.spot_id).update({'status': 'A'})
+        db.session.commit()
+
+        user_id = reservation.user_id
+        invalidate('all_parking_lots', f'parking_spots_{lot_id}', f'user_reservations_{user_id}',
+                   f'user_stats_{user_id}', 'admin_dashboard_stats', 'parking_lots_revenue', 'all_users')
+
+        return jsonify({
+            'message': 'Spot released successfully',
+            'parking_cost': cost
+        }), 200
+
+    @app.route('/api/user-reservations/<int:user_id>', methods=['GET'])
+    @login_required
+    @self_or_admin
+    @cache.cached(timeout=30, key_prefix=lambda: f'user_reservations_{request.view_args["user_id"]}')
+    def get_user_reservations(user_id):
+        reservations = Reservation.query.filter_by(user_id=user_id).order_by(Reservation.parking_timestamp.desc()).all()
+        numbers = spot_numbers({res.spot.lot_id for res in reservations})
+        result = []
+
+        for res in reservations:
+            duration = None
+            if res.leaving_timestamp:
+                seconds = (res.leaving_timestamp - res.parking_timestamp).total_seconds()
+                duration = f"{int(seconds // 3600)}h {int((seconds % 3600) // 60)}m"
+
+            parking_lot = res.spot.parking_lot
+
+            result.append({
+                'id': res.id,
+                'spot_id': res.spot_id,
+                'spot_number': numbers.get(res.spot_id),
+                'lot_name': parking_lot.prime_location_name,
+                'address': parking_lot.address,
+                'pin_code': parking_lot.pin_code,
+                'price_per_hour': booked_price(res),
+                'vehicle_number': res.vehicle_number,
+                'parking_timestamp': iso(res.parking_timestamp),
+                'leaving_timestamp': iso(res.leaving_timestamp),
+                'duration': duration,
+                'parking_cost': res.parking_cost,
+                'status': res.status
+            })
+
+        return jsonify(result), 200
+
+    @app.route('/api/user-stats/<int:user_id>', methods=['GET'])
+    @login_required
+    @self_or_admin
+    @cache.cached(timeout=60, key_prefix=lambda: f'user_stats_{request.view_args["user_id"]}')
+    def get_user_stats(user_id):
+        reservations = Reservation.query.filter_by(user_id=user_id).all()
+
+        total_spent = sum(res.parking_cost for res in reservations if res.parking_cost)
+
+        lot_spending = {}
+        for res in reservations:
+            if res.parking_cost and res.spot and res.spot.parking_lot:
+                lot_name = res.spot.parking_lot.prime_location_name
+                lot_spending[lot_name] = lot_spending.get(lot_name, 0) + res.parking_cost
+
+        # Last 6 IST months, oldest first
+        now = datetime.now(tasks.IST)
+        months = []
+        year, month = now.year, now.month
+        for _ in range(6):
+            months.insert(0, (year, month))
+            year, month = (year, month - 1) if month > 1 else (year - 1, 12)
+        monthly = {f'{year}-{month:02d}': {'bookings': 0, 'spent': 0.0} for year, month in months}
+        for res in reservations:
+            bucket = monthly.get(tasks.to_ist(res.parking_timestamp).strftime('%Y-%m'))
+            if bucket:
+                bucket['bookings'] += 1
+                if res.status == 'completed' and res.parking_cost:
+                    bucket['spent'] += res.parking_cost
+
+        return jsonify({
+            'total_bookings': len(reservations),
+            'total_spent': round(total_spent, 2),
+            'lot_usage': [
+                {'location_name': lot_name, 'total_spent': round(amount, 2)}
+                for lot_name, amount in lot_spending.items()
+            ],
+            'monthly_spend': [
+                {
+                    'month': f'{year}-{month:02d}',
+                    'label': f'{month_abbr[month]} {year}',
+                    'total_spent': round(monthly[f'{year}-{month:02d}']['spent'], 2),
+                    'bookings': monthly[f'{year}-{month:02d}']['bookings']
+                }
+                for year, month in months
+            ]
+        }), 200
+
     # Profile
 
     @app.route('/api/user/profile/<int:user_id>', methods=['PUT'])
