@@ -618,6 +618,118 @@ def register_routes(app, cache):
             ]
         }), 200
 
+    # Admin
+
+    @app.route('/api/users', methods=['GET'])
+    @admin_required
+    @cache.cached(timeout=60, key_prefix='all_users')
+    def get_users():
+        users = User.query.filter_by(role='user').all()
+        result = []
+
+        for user in users:
+            active = Reservation.query.filter_by(user_id=user.id, status='active').first()
+            total_reservations = Reservation.query.filter_by(user_id=user.id).count()
+
+            result.append({
+                'id': user.id,
+                'username': user.username,
+                'email': user.email,
+                'role': 'user',
+                'avatar': user.avatar,
+                'created_at': iso(user.created_at),
+                'active_reservations': 1 if active else 0,
+                'total_reservations': total_reservations,
+                'active_vehicle': active.vehicle_number if active else None,
+                'active_lot': active.spot.parking_lot.prime_location_name if active else None
+            })
+
+        return jsonify(result), 200
+
+    @app.route('/api/users/<int:user_id>', methods=['DELETE'])
+    @admin_required
+    def delete_user(user_id):
+        user = db.session.get(User, user_id)
+
+        if not user:
+            return jsonify({'message': 'User not found'}), 404
+
+        if user.role == 'admin':
+            return jsonify({'message': 'Cannot delete admin user'}), 400
+
+        parked_message = 'Cannot delete a user who is currently parked. Release the spot first.'
+        if Reservation.query.filter_by(user_id=user_id, status='active').first():
+            return jsonify({'message': parked_message}), 400
+
+        # Bulk deletes skip the ORM cascade, so a booking made after the check above
+        # blocks the delete through the foreign key instead of being removed with the user
+        try:
+            Reservation.query.filter(Reservation.user_id == user_id, Reservation.status != 'active').delete()
+            User.query.filter_by(id=user_id).delete()
+            db.session.commit()
+        except IntegrityError:
+            db.session.rollback()
+            return jsonify({'message': parked_message}), 400
+
+        invalidate('all_users', 'admin_dashboard_stats', 'parking_lots_revenue',
+                   f'user_reservations_{user_id}', f'user_stats_{user_id}')
+
+        return jsonify({'message': 'User deleted successfully'}), 200
+
+    @app.route('/api/admin/dashboard-stats', methods=['GET'])
+    @admin_required
+    @cache.cached(timeout=30, key_prefix='admin_dashboard_stats')
+    def get_admin_dashboard_stats():
+        active_lot_ids = [lot.id for lot in ParkingLot.query.filter_by(is_deleted=False).all()]
+
+        if active_lot_ids:
+            total_spots = ParkingSpot.query.filter(ParkingSpot.lot_id.in_(active_lot_ids)).count()
+            occupied_spots = ParkingSpot.query.filter(ParkingSpot.lot_id.in_(active_lot_ids), ParkingSpot.status == 'O').count()
+            available_spots = ParkingSpot.query.filter(ParkingSpot.lot_id.in_(active_lot_ids), ParkingSpot.status == 'A').count()
+        else:
+            total_spots = occupied_spots = available_spots = 0
+
+        # Revenue and bookings from lots that still exist, matching the revenue chart
+        completed =Reservation.query.join(ParkingSpot).filter(
+            ParkingSpot.lot_id.in_(active_lot_ids),
+            Reservation.status == 'completed',
+            Reservation.parking_cost.isnot(None)
+        ).all()
+        today = datetime.now(tasks.IST).date()
+        today_start = ist_day_start(today)
+        total_revenue = sum(res.parking_cost for res in completed)
+        revenue_today = sum(res.parking_cost for res in completed if res.leaving_timestamp >= today_start)
+
+        # Bookings per IST day for the last 14 days, oldest first
+        days = [today - timedelta(days=i) for i in range(13, -1, -1)]
+        daily = dict.fromkeys(days, 0)
+        recent = db.session.query(Reservation.parking_timestamp).join(ParkingSpot).filter(
+            ParkingSpot.lot_id.in_(active_lot_ids),
+            Reservation.parking_timestamp >= ist_day_start(days[0]))
+        for (parked_at,) in recent:
+            day = tasks.to_ist(parked_at).date()
+            if day in daily:
+                daily[day] += 1
+        week_start = today - timedelta(days=today.weekday())
+
+        return jsonify({
+            'total_lots': len(active_lot_ids),
+            'total_spots': total_spots,
+            'occupied_spots': occupied_spots,
+            'available_spots': available_spots,
+            'total_users': User.query.filter_by(role='user').count(),
+            'active_reservations': Reservation.query.filter_by(status='active').count(),
+            'total_revenue': round(total_revenue, 2),
+            'revenue_today': round(revenue_today, 2),
+            'total_bookings': Reservation.query.join(ParkingSpot).filter(ParkingSpot.lot_id.in_(active_lot_ids)).count(),
+            'bookings_today': daily[today],
+            'bookings_this_week': sum(count for day, count in daily.items() if day >= week_start),
+            'daily_bookings': [
+                {'date': day.isoformat(), 'label': f'{day.day} {month_abbr[day.month]}', 'count': daily[day]}
+                for day in days
+            ]
+        }), 200
+
     # Profile
 
     @app.route('/api/user/profile/<int:user_id>', methods=['PUT'])
