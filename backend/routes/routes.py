@@ -430,6 +430,35 @@ def register_routes(app, cache):
 
         return jsonify(result), 200
 
+    # Parking spots
+
+    @app.route('/api/parking-spots/<int:lot_id>', methods=['GET'])
+    @admin_required
+    @cache.cached(timeout=30, key_prefix=lambda: f'parking_spots_{request.view_args["lot_id"]}')
+    def get_parking_spots(lot_id):
+        spots = ParkingSpot.query.filter_by(lot_id=lot_id).order_by(ParkingSpot.id).all()
+        result = []
+
+        for number, spot in enumerate(spots, 1):
+            spot_data = {
+                'id': spot.id,
+                'spot_number': number,
+                'lot_id': spot.lot_id,
+                'status': spot.status
+            }
+
+            if spot.status == 'O':
+                reservation = Reservation.query.filter_by(spot_id=spot.id, status='active').first()
+                if reservation:
+                    spot_data['user_id'] = reservation.user_id
+                    spot_data['username'] = reservation.user.username
+                    spot_data['vehicle_number'] = reservation.vehicle_number
+                    spot_data['parking_timestamp'] = iso(reservation.parking_timestamp)
+
+            result.append(spot_data)
+
+        return jsonify(result), 200
+
     # Reservations
 
     @app.route('/api/book-spot', methods=['POST'])
