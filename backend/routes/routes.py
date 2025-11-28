@@ -828,3 +828,56 @@ def register_routes(app, cache):
                 'avatar': user.avatar
             }
         }), 200
+
+    # Export
+
+    @app.route('/api/export-csv', methods=['POST'])
+    @login_required
+    def trigger_csv_export():
+        task = tasks.export_user_history_csv.delay(g.user.id)
+        return jsonify({
+            'task_id': task.id,
+            'status': 'processing',
+            'message': 'CSV export started.'
+        }), 202
+
+    def export_result(task_id):
+        """Return (state, result dict or None)."""
+        result = AsyncResult(task_id, app=tasks.celery_app)
+        payload = result.result if result.state == 'SUCCESS' and isinstance(result.result, dict) else None
+        return result.state, payload
+
+    @app.route('/api/export-status/<task_id>', methods=['GET'])
+    @login_required
+    def check_export_status(task_id):
+        state, payload = export_result(task_id)
+
+        if state == 'PENDING':
+            return jsonify({'status': 'pending', 'message': 'Export is queued.'}), 200
+        if state in ('STARTED', 'RETRY'):
+            return jsonify({'status': 'processing', 'message': 'Export is being prepared.'}), 200
+        if payload is not None and payload.get('user_id') != g.user.id:
+            return jsonify({'message': 'Not allowed'}), 403
+        if payload is None or payload.get('status') != 'success':
+            message = payload.get('message') if payload else 'Export failed.'
+            return jsonify({'status': 'error', 'message': message}), 200
+        return jsonify({'status': 'success', 'message': 'Your CSV is ready to download.'}), 200
+
+    @app.route('/api/export/<task_id>/download', methods=['GET'])
+    @login_required
+    def download_export(task_id):
+        state, payload = export_result(task_id)
+
+        if state in ('PENDING', 'STARTED', 'RETRY'):
+            return jsonify({'message': 'Export is not ready yet'}), 409
+        if payload is None or payload.get('status') != 'success':
+            return jsonify({'message': 'Export not found'}), 404
+        if payload.get('user_id') != g.user.id:
+            return jsonify({'message': 'Not allowed'}), 403
+
+        return send_file(
+            io.BytesIO(payload['csv_data'].encode('utf-8')),
+            mimetype='text/csv',
+            as_attachment=True,
+            download_name=payload['filename']
+        )
