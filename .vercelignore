@@ -1,0 +1,9 @@
+.venv
+instance
+frontend/assets
+__pycache__
+*.db
+.env*
+.vercel
+dump.rdb
+celerybeat-schedule*

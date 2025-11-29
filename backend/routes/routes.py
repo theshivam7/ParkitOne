@@ -881,3 +881,24 @@ def register_routes(app, cache):
             as_attachment=True,
             download_name=payload['filename']
         )
+
+    # Cron (Vercel Cron sends Bearer CRON_SECRET)
+
+    def cron_authorized():
+        secret = app.config.get('CRON_SECRET')
+        header = request.headers.get('Authorization', '')
+        return bool(secret) and hmac.compare_digest(header.encode(), f'Bearer {secret}'.encode())
+
+    @app.route('/api/cron/daily-reminder', methods=['GET'])
+    def cron_daily_reminder():
+        if not cron_authorized():
+            return jsonify({'message': 'Unauthorized'}), 401
+        task = tasks.send_daily_reminder.delay()
+        return jsonify({'status': task.status, 'task_id': task.id}), 200
+
+    @app.route('/api/cron/monthly-report', methods=['GET'])
+    def cron_monthly_report():
+        if not cron_authorized():
+            return jsonify({'message': 'Unauthorized'}), 401
+        task = tasks.send_all_monthly_reports.delay()
+        return jsonify({'status': task.status, 'task_id': task.id}), 200

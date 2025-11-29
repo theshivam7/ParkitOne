@@ -1,0 +1,7 @@
+{
+  "framework": "flask",
+  "crons": [
+    { "path": "/api/cron/daily-reminder", "schedule": "30 12 * * *" },
+    { "path": "/api/cron/monthly-report", "schedule": "30 3 1 * *" }
+  ]
+}
