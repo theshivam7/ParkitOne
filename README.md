@@ -24,9 +24,9 @@ The V1 of this app, built for MAD I with Flask and Jinja, is [Parkit](https://gi
 | Admin | `admin` | `admin123` |
 | User | `demo@parkitv2.com` | `demo1234` |
 
-## Screenshot
+## Demo
 
-![Parkit V2 home page](frontend/assets/screenshots/home.png)
+<p align="center"><a href="frontend/assets/brag.mp4"><img src="frontend/assets/brag.gif" alt="Parkit V2 demo"></a></p>
 
 ## Features
 
